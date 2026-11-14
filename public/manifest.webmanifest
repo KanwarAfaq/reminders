@@ -3,7 +3,7 @@
   "name": "Kanwar Reminders",
   "short_name": "Reminders",
   "description": "Reminders with alarms and a daily work-hours log.",
-  "start_url": "/#/reminders",
+  "start_url": "/#/home",
   "scope": "/",
   "display": "standalone",
   "orientation": "any",

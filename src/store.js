@@ -1,5 +1,5 @@
 // Shared client state + helpers for reminders and working hours.
-export const S = { reminders: [], work: [], settings: { tz: 'Asia/Taipei', workPromptTime: '19:00', workPromptOn: true, schools: [], classes: [] }, line: false, loaded: false };
+export const S = { reminders: [], work: [], settings: { tz: 'Asia/Taipei', workPromptTime: '19:00', workPromptOn: true, schools: [], classes: [], rates: {}, currency: 'NT$', weeklyOn: true, weeklyTime: '20:00' }, line: false, loaded: false };
 
 export const pad = n => String(n).padStart(2, '0');
 export const ymd = d => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -16,15 +16,17 @@ export function rel(ms, now = Date.now()) {
   return d >= 0 ? `in ${t}` : `${t} ago`;
 }
 
-export function report(entries, from, to) {
+export function report(entries, from, to, rates = {}) {
   const list = entries.filter(e => e.date >= from && e.date <= to);
   const total = list.reduce((a, e) => a + e.minutes, 0);
+  const earn = e => Math.round(e.minutes / 60 * (Number(rates[e.school]) || 0));
+  const earnings = list.reduce((a, e) => a + earn(e), 0);
   const group = key => {
     const m = new Map(); for (const e of list) m.set(e[key], (m.get(e[key]) || 0) + e.minutes);
     return [...m].map(([name, min]) => ({ name, minutes: min, label: fmtHours(min), pct: total ? Math.round(min * 100 / total) : 0 })).sort((a, b) => b.minutes - a.minutes);
   };
-  return { from, to, total, label: fmtHours(total), hours: +(total / 60).toFixed(2), sessions: list.length,
-    bySchool: group('school'), byClass: group('classKey'), byDay: group('date').sort((a, b) => a.name.localeCompare(b.name)),
+  return { from, to, earnings, total, label: fmtHours(total), hours: +(total / 60).toFixed(2), sessions: list.length,
+    bySchool: group('school').map(x => ({ ...x, earn: list.filter(e => e.school === x.name).reduce((a, e) => a + earn(e), 0) })), byClass: group('classKey'), byDay: group('date').sort((a, b) => a.name.localeCompare(b.name)),
     entries: list.sort((a, b) => (b.date + b.start).localeCompare(a.date + a.start)) };
 }
 export function rangePreset(p) {

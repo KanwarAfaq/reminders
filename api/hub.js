@@ -3,13 +3,13 @@ import {
   partsInTz, minutes, durationMin, fmtHours, nextRepeat, lineReady, sendLine, reminderCard, workPromptCard, reportCard, pushAll, HUB_URL,
 } from './_lib.js';
 
-const DEFAULTS = { tz: 'Asia/Taipei', workPromptTime: '19:00', workPromptOn: true, schools: [], classes: [] };
+const DEFAULTS = { tz: 'Asia/Taipei', workPromptTime: '19:00', workPromptOn: true, schools: [], classes: [], rates: {}, currency: 'NT$', weeklyOn: true, weeklyTime: '20:00' };
 const send = (res, code, body) => { res.setHeader('Cache-Control', 'no-store'); res.status(code).json(body); };
 const clean = (s, n) => String(s ?? '').trim().slice(0, n);
 const isDate = s => /^\d{4}-\d{2}-\d{2}$/.test(s);
 const isHM = s => /^([01]\d|2[0-3]):[0-5]\d$/.test(s);
 
-export function buildReport(entries, from, to) {
+export function buildReport(entries, from, to, rates = {}, currency = '') {
   const list = entries.filter(e => e.date >= from && e.date <= to);
   const total = list.reduce((a, e) => a + e.minutes, 0);
   const group = key => {
@@ -17,21 +17,32 @@ export function buildReport(entries, from, to) {
     for (const e of list) m.set(e[key], (m.get(e[key]) || 0) + e.minutes);
     return [...m].map(([name, min]) => ({ name, minutes: min, label: fmtHours(min), pct: total ? Math.round(min * 100 / total) : 0 })).sort((a, b) => b.minutes - a.minutes);
   };
+  const earn = e => Math.round(e.minutes / 60 * (Number(rates[e.school]) || 0));
+  const earnings = list.reduce((a, e) => a + earn(e), 0);
   const byDay = group('date').sort((a, b) => a.name.localeCompare(b.name));
-  return { from, to, totalMinutes: total, totalLabel: fmtHours(total), hours: +(total / 60).toFixed(2), sessions: list.length, days: byDay.length,
-    bySchool: group('school'), byClass: group('classKey'), byDay, entries: list.sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)) };
+  return { from, to, earnings, currency, totalMinutes: total, totalLabel: fmtHours(total), hours: +(total / 60).toFixed(2), sessions: list.length, days: byDay.length,
+    bySchool: group('school').map(x => ({ ...x, earn: list.filter(e => e.school === x.name).reduce((a, e) => a + earn(e), 0) })), byClass: group('classKey'), byDay, entries: list.sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)) };
 }
 
 export async function tick(now = Date.now()) {
   const out = { reminders: 0, prompted: false };
   const settings = { ...DEFAULTS, ...(await getJSON('hub:settings', {})) };
   for (const r of await hgetall('hub:reminders')) {
-    if (r.done || r.sent || r.at > now) continue;
+    if (r.done || r.sent) continue;
+    const lead = Number(r.lead) || 0;
+    if (lead && !r.earlySent && r.at > now && r.at - lead * 60000 <= now) {
+      const mins = Math.max(1, Math.round((r.at - now) / 60000));
+      await sendLine(reminderCard({ ...r, title: `In ${mins} min: ${r.title}` }, settings.tz));
+      await pushAll({ title: `⏳ In ${mins} min: ${r.title}`, body: r.detail || 'Upcoming reminder', tag: r.id + '-early', url: '/#/reminders', vibrate: [200, 100, 200] });
+      await hset('hub:reminders', r.id, { ...r, earlySent: now });
+      out.early = (out.early || 0) + 1; continue;
+    }
+    if (r.at > now) continue;
     const line = await sendLine(reminderCard(r, settings.tz));
     const pushed = await pushAll({ title: `⏰ ${r.title}`, body: r.detail || 'Reminder', tag: r.id, url: '/#/reminders', vibrate: [300, 150, 300, 150, 600] });
     const next = nextRepeat(r.at, r.repeat);
     // Repeating reminders roll forward; one-off reminders are marked sent so they never fire twice.
-    await hset('hub:reminders', r.id, next ? { ...r, at: Math.max(next, now + 60000), lastSent: now } : { ...r, sent: now, lineOk: line.ok, lineError: line.error, pushed });
+    await hset('hub:reminders', r.id, next ? { ...r, at: Math.max(next, now + 60000), lastSent: now, earlySent: 0 } : { ...r, sent: now, lineOk: line.ok, lineError: line.error, pushed });
     out.reminders++;
   }
   if (settings.workPromptOn) {
@@ -44,6 +55,17 @@ export async function tick(now = Date.now()) {
         out.prompted = true;
       }
       await setJSON('hub:settings', { ...settings, lastPrompt: date });
+    }
+  }
+  if (settings.weeklyOn) {
+    const { date, hm } = partsInTz(now, settings.tz);
+    const dow = new Date(date + 'T12:00:00Z').getUTCDay();
+    if (dow === 0 && hm >= settings.weeklyTime && settings.lastWeekly !== date) {
+      const from = new Date(date + 'T12:00:00Z'); from.setUTCDate(from.getUTCDate() - 6);
+      const rep = buildReport(await hgetall('hub:work'), from.toISOString().slice(0, 10), date, settings.rates, settings.currency);
+      if (rep.sessions) { await sendLine(reportCard(rep)); out.weekly = true; }
+      const cur = { ...(await getJSON('hub:settings', {})) };
+      await setJSON('hub:settings', { ...settings, ...cur, lastWeekly: date });
     }
   }
   return out;
@@ -82,13 +104,20 @@ export default async function handler(req, res) {
         const at = Number(body.at), title = clean(body.title, 120);
         if (!title || !Number.isFinite(at)) return send(res, 400, { error: 'Title and date/time are required' });
         const old = body.id ? (await hgetall('hub:reminders')).find(r => r.id === body.id) : null;
-        const r = { id: old?.id || uid(), title, detail: clean(body.detail, 1000), at, repeat: ['daily', 'weekly'].includes(body.repeat) ? body.repeat : 'none', created: old?.created || Date.now() };
+        const r = { id: old?.id || uid(), title, detail: clean(body.detail, 1000), at, repeat: ['daily', 'weekly'].includes(body.repeat) ? body.repeat : 'none', lead: [0, 5, 10, 15, 30, 60, 120, 1440].includes(Number(body.lead)) ? Number(body.lead) : 0, created: old?.created || Date.now() };
         await hset('hub:reminders', r.id, r);
         return send(res, 200, { ok: true, reminder: r });
       }
       case 'reminder-done': {
         const r = (await hgetall('hub:reminders')).find(x => x.id === body.id);
         if (r) await hset('hub:reminders', r.id, { ...r, done: !r.done });
+        return send(res, 200, { ok: true });
+      }
+      case 'reminder-snooze': {
+        const r = (await hgetall('hub:reminders')).find(x => x.id === body.id);
+        if (!r) return send(res, 404, { error: 'Reminder not found' });
+        const m = Math.min(Math.max(Number(body.minutes) || 10, 1), 1440);
+        await hset('hub:reminders', r.id, { ...r, at: Date.now() + m * 60000, sent: 0, done: false, earlySent: 0 });
         return send(res, 200, { ok: true });
       }
       case 'reminder-delete': await hdel('hub:reminders', clean(body.id, 40)); return send(res, 200, { ok: true });
@@ -107,7 +136,7 @@ export default async function handler(req, res) {
       case 'work-delete': await hdel('hub:work', clean(body.id, 40)); return send(res, 200, { ok: true });
       case 'work-report': {
         if (!isDate(body.from) || !isDate(body.to) || body.from > body.to) return send(res, 400, { error: 'Pick a valid date range' });
-        const rep = buildReport(await hgetall('hub:work'), body.from, body.to);
+        const set = await settings(), rep = buildReport(await hgetall('hub:work'), body.from, body.to, set.rates, set.currency);
         if (body.line) { const r = await sendLine(reportCard(rep)); return send(res, 200, { ok: r.ok, error: r.error }); }
         return send(res, 200, rep);
       }
@@ -120,10 +149,21 @@ export default async function handler(req, res) {
         if (body.tz) { try { Intl.DateTimeFormat('en', { timeZone: body.tz }); next.tz = body.tz; } catch { /* keep old */ } }
         if (Array.isArray(body.schools)) next.schools = [...new Set(body.schools.map(x => clean(x, 80)).filter(Boolean))];
         if (Array.isArray(body.classes)) next.classes = [...new Set(body.classes.map(x => clean(x, 80)).filter(Boolean))];
+        if (body.rates && typeof body.rates === 'object') next.rates = Object.fromEntries(Object.entries(body.rates).map(([k, v]) => [clean(k, 80), Math.min(Math.max(Number(v) || 0, 0), 1e6)]).filter(([k, v]) => k && v > 0));
+        if (typeof body.currency === 'string') next.currency = clean(body.currency, 6);
+        if (typeof body.weeklyOn === 'boolean') next.weeklyOn = body.weeklyOn;
+        if (isHM(body.weeklyTime)) next.weeklyTime = body.weeklyTime;
         await setJSON('hub:settings', next);
         return send(res, 200, { ok: true, settings: next });
       }
 
+      case 'import': {
+        const rs = Array.isArray(body.reminders) ? body.reminders.slice(0, 2000) : [], ws = Array.isArray(body.work) ? body.work.slice(0, 20000) : [];
+        let n = 0;
+        for (const r of rs) if (r && r.id && r.title && Number.isFinite(Number(r.at))) { await hset('hub:reminders', clean(r.id, 40), { ...r, id: clean(r.id, 40), title: clean(r.title, 120), detail: clean(r.detail, 1000), at: Number(r.at) }); n++; }
+        for (const e of ws) if (e && e.id && isDate(e.date) && isHM(e.start) && isHM(e.end) && e.school && e.class) { const sc = clean(e.school, 80), cl = clean(e.class, 80); await hset('hub:work', clean(e.id, 40), { id: clean(e.id, 40), date: e.date, school: sc, class: cl, classKey: `${sc} · ${cl}`, start: e.start, end: e.end, minutes: durationMin(e.start, e.end), note: clean(e.note, 300), created: Date.now() }); n++; }
+        return send(res, 200, { ok: true, imported: n });
+      }
       case 'push-subscribe': {
         const sub = body.subscription;
         if (!sub?.endpoint) return send(res, 400, { error: 'Invalid subscription' });

@@ -11,3 +11,9 @@ Standalone PWA + Android app: reminders (alarm, vibration, push, LINE card) and 
 * **Android APK**: reminders are scheduled as native alarms on the phone, so they ring on time even offline.
 * **LINE / push when the phone is off**: create a free per-minute job at cron-job.org that calls
   `https://<your-domain>/api/hub?op=tick` every minute.
+
+## Features
+Home dashboard (next reminder, today/week/month hours, streak), reminders with early alerts and snooze, work-hours log with hourly rates and earnings, weekly LINE report (Sunday), CSV copy, JSON backup/restore.
+
+## Auto-update
+The web app checks `/version.json` every 10 minutes and on focus and reloads itself when a new build is deployed. The Android app loads the live site, so it updates with every deploy (reminder alarms stay native on the phone).

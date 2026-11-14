@@ -35,7 +35,7 @@ test('PIN setup, auth and lockout-safe wrong pin', async () => {
 });
 
 test('reminder fires once, sends LINE flex card, repeating rolls forward', async () => {
-  lineSent.length = 0;
+  lineSent.length = 0; await call('settings-save', { workPromptOn: false }); // keep this test independent of time of day
   const at = Date.now() - 1000;
   const one = (await call('reminder-save', { title: 'Parent meeting', detail: 'Room 3', at })).json.reminder;
   const rep = (await call('reminder-save', { title: 'Daily standup', at, repeat: 'daily' })).json.reminder;
@@ -68,8 +68,33 @@ test('overnight sessions wrap past midnight', async () => {
 
 test('evening prompt sent once per day when nothing logged', async () => {
   store.delete('hub:work'); lineSent.length = 0;
-  await call('settings-save', { workPromptTime: '00:00', tz: 'Asia/Taipei' });
+  await call('settings-save', { workPromptOn: true, workPromptTime: '00:00', tz: 'Asia/Taipei' });
   const a = await tick(); assert.equal(a.prompted, true);
   const b = await tick(); assert.equal(b.prompted, false);
   assert.match(lineSent.at(-1).messages[0].altText, /working hours/i);
+});
+
+test('early alert, snooze, earnings and import', async () => {
+  const now = Date.now(); lineSent.length = 0;
+  const saved = (await call('reminder-save', { title: 'Lead test', at: now + 20 * 60000, lead: 30, repeat: 'none' })).json.reminder;
+  assert.equal(saved.lead, 30);
+  const t1 = await tick(now); assert.equal(t1.early, 1);
+  assert.ok(lineSent.some(m => m.messages[0].altText.includes('In 20 min')));
+  const t2 = await tick(now + 1000); assert.equal(t2.early || 0, 0); // not repeated
+  await call('reminder-snooze', { id: saved.id, minutes: 15 });
+  const st = (await call('state')).json.reminders.find(r => r.id === saved.id);
+  assert.ok(st.at > now + 14 * 60000 && !st.sent);
+  await call('settings-save', { rates: { Alpha: 500 }, currency: 'NT$' });
+  await call('work-save', { date: '2026-01-05', school: 'Alpha', class: 'A1', start: '10:00', end: '12:00' });
+  const rep = (await call('work-report', { from: '2026-01-01', to: '2026-01-31' })).json;
+  assert.equal(rep.earnings, 1000); assert.equal(rep.bySchool[0].earn, 1000);
+  const imp = await call('import', { reminders: [{ id: 'imp1', title: 'Imported', at: now + 1e7 }], work: [{ id: 'w9', date: '2026-01-06', school: 'Alpha', class: 'A1', start: '09:00', end: '10:30' }] });
+  assert.equal(imp.json.imported, 2);
+});
+
+test('weekly report goes out on Sunday evening once', async () => {
+  lineSent.length = 0;
+  const sun = Date.parse('2026-01-11T13:00:00Z'); // Sunday 21:00 in Asia/Taipei
+  const a = await tick(sun); assert.equal(a.weekly, true);
+  const b = await tick(sun + 60000); assert.ok(!b.weekly);
 });

@@ -5,7 +5,7 @@ self.addEventListener('activate', e => { e.waitUntil(caches.keys().then(k => Pro
 self.addEventListener('fetch', e => {
   const r = e.request, u = new URL(r.url);
   if (r.method !== 'GET' || u.origin !== location.origin) return;
-  if (u.pathname.startsWith('/api/')) return;
+  if (u.pathname.startsWith('/api/') || u.pathname === '/version.json') return;
   if (r.mode === 'navigate') { e.respondWith(fetch(r).catch(() => caches.match('/'))); return; }
   e.respondWith(caches.match(r).then(hit => {
     const net = fetch(r).then(res => { if (res.ok) caches.open(V).then(c => c.put(r, res.clone())); return res; }).catch(() => hit);

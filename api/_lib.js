@@ -107,6 +107,7 @@ export function workPromptCard(date) {
 export function reportCard(rep) {
   const body = [
     { type: 'box', layout: 'baseline', spacing: 'md', contents: [txt(rep.totalLabel, { size: '3xl', weight: 'bold', color: '#111827', flex: 0 }), txt(`${rep.sessions} sessions · ${rep.days} days`, { size: 'sm', color: '#8a94ad' })] },
+    ...(rep.earnings ? [row('Earnings', `${rep.currency || ''} ${rep.earnings.toLocaleString('en-US')}`)] : []),
     { type: 'separator' },
     ...rep.bySchool.slice(0, 8).map(s => row(s.name, `${s.label} (${s.pct}%)`)),
   ];

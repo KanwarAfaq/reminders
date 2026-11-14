@@ -1,5 +1,5 @@
 import { api, getKey, setKey } from './api.js';
-import { S, esc, ymd, hm, toLocalInput, durationMin, fmtHours, fmtWhen, rel, report, rangePreset, toCSV } from './store.js';
+import { S, esc, ymd, hm, toLocalInput, durationMin, fmtHours, fmtWhen, rel, report, rangePreset, toCSV, pad } from './store.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 let cfg = null, ui = { tab: 'log', range: 'month', from: '', to: '', editing: null };
@@ -22,8 +22,11 @@ async function syncNative() {
     if ((await L.requestPermissions()).display !== 'granted') return;
     const pend = await L.getPending(); if (pend.notifications.length) await L.cancel({ notifications: pend.notifications });
     const hash = s => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7) & 0x7fffffff;
-    const items = S.reminders.filter(r => !r.done && !r.sent && r.at > Date.now()).slice(0, 60)
-      .map(r => ({ id: hash(r.id), title: '⏰ ' + r.title, body: r.detail || 'Reminder', schedule: { at: new Date(r.at), allowWhileIdle: true }, extra: { id: r.id } }));
+    const live = S.reminders.filter(r => !r.done && !r.sent).slice(0, 60);
+    const items = [
+      ...live.filter(r => r.at > Date.now()).map(r => ({ id: hash(r.id), title: '⏰ ' + r.title, body: r.detail || 'Reminder', schedule: { at: new Date(r.at), allowWhileIdle: true }, extra: { id: r.id } })),
+      ...live.filter(r => r.lead && !r.earlySent && r.at - r.lead * 60000 > Date.now()).map(r => ({ id: hash(r.id + 'e'), title: `⏳ In ${r.lead >= 60 ? r.lead / 60 + ' h' : r.lead + ' min'}: ${r.title}`, body: r.detail || 'Upcoming reminder', schedule: { at: new Date(r.at - r.lead * 60000), allowWhileIdle: true }, extra: { id: r.id } })),
+    ];
     if (items.length) await L.schedule({ notifications: items });
   } catch { /* plugin unavailable */ }
 }
@@ -54,11 +57,12 @@ function pinForm(el, create, msg = '') {
 }
 
 /* ---------- reminders ---------- */
+const LEADS = [[0, 'No early alert'], [5, '5 min before'], [10, '10 min before'], [15, '15 min before'], [30, '30 min before'], [60, '1 hour before'], [120, '2 hours before'], [1440, '1 day before']];
 function reminderRow(r) {
   const state = r.done ? 'Done' : r.sent ? 'Sent' : r.at < Date.now() ? 'Due' : 'Upcoming';
   return `<li class="item ${r.done ? 'dim' : ''}"><div class="grow"><b>${esc(r.title)}</b>${r.detail ? `<div class="mut">${esc(r.detail)}</div>` : ''}
-    <div class="mut sm">${fmtWhen(r.at)} · ${rel(r.at)}${r.repeat !== 'none' ? ` · repeats ${r.repeat}` : ''} · <span class="st ${state}">${state}</span></div></div>
-    <div class="acts"><button class="mini" data-act="r-done" data-id="${r.id}" title="Mark done">✓</button><button class="mini" data-act="r-edit" data-id="${r.id}" title="Edit">✎</button><button class="mini" data-act="r-del" data-id="${r.id}" title="Delete">🗑</button></div></li>`;
+    <div class="mut sm">${fmtWhen(r.at)} · ${rel(r.at)}${r.repeat !== 'none' ? ` · repeats ${r.repeat}` : ''}${r.lead ? ` · early alert ${LEADS.find(l => l[0] === r.lead)?.[1] || r.lead + ' min'}` : ''} · <span class="st ${state}">${state}</span></div></div>
+    <div class="acts"><button class="mini" data-act="r-snooze" data-id="${r.id}" title="Snooze 1 hour">💤</button><button class="mini" data-act="r-done" data-id="${r.id}" title="Mark done">✓</button><button class="mini" data-act="r-edit" data-id="${r.id}" title="Edit">✎</button><button class="mini" data-act="r-del" data-id="${r.id}" title="Delete">🗑</button></div></li>`;
 }
 function remindersPage() {
   const e = ui.editing ? S.reminders.find(r => r.id === ui.editing) : null;
@@ -70,6 +74,7 @@ function remindersPage() {
     <label>Details<textarea class="in" name="detail" rows="3" maxlength="1000" placeholder="Optional notes">${esc(e?.detail)}</textarea></label>
     <div class="two"><label>Date &amp; time<input class="in" type="datetime-local" name="at" required value="${toLocalInput(def)}"></label>
     <label>Repeat<select class="in" name="repeat">${['none', 'daily', 'weekly'].map(v => `<option value="${v}" ${e?.repeat === v ? 'selected' : ''}>${v === 'none' ? 'Does not repeat' : v[0].toUpperCase() + v.slice(1)}</option>`).join('')}</select></label></div>
+    <label>Early alert<select class="in" name="lead">${LEADS.map(([v, l]) => `<option value="${v}" ${(e?.lead || 0) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
     <p class="mut sm">You'll get an in-app alert with vibration, a phone notification${S.line ? ' and a LINE card' : ''} at that time.</p>
     <div class="row"><button class="btn pri">${e ? 'Save changes' : 'Add reminder'}</button>${e ? '<button type="button" class="btn" data-act="r-cancel">Cancel</button>' : ''}</div></form>
   <h2 class="sec">Upcoming (${up.length})</h2><ul class="list">${up.map(reminderRow).join('') || '<li class="empty">Nothing scheduled.</li>'}</ul>
@@ -96,12 +101,12 @@ function logTab(prefill = {}) {
 }
 function detailTab() {
   if (!ui.from) [ui.from, ui.to] = rangePreset(ui.range);
-  const r = report(S.work, ui.from, ui.to);
-  const bars = (arr, n = 8) => arr.slice(0, n).map(x => `<div class="bar"><div class="bl"><span>${esc(x.name)}</span><b>${x.label}</b></div><div class="bt"><i style="width:${Math.max(x.pct, 3)}%"></i></div></div>`).join('') || '<div class="empty">No data</div>';
+  const r = report(S.work, ui.from, ui.to, S.settings.rates), cur = S.settings.currency || '';
+  const bars = (arr, n = 8) => arr.slice(0, n).map(x => `<div class="bar"><div class="bl"><span>${esc(x.name)}</span><b>${x.label}${x.earn ? ` · ${cur} ${x.earn.toLocaleString()}` : ''}</b></div><div class="bt"><i style="width:${Math.max(x.pct, 3)}%"></i></div></div>`).join('') || '<div class="empty">No data</div>';
   return `<div class="panel"><h2>Details</h2>
     <div class="chips">${[['today', 'Today'], ['week', 'This week'], ['month', 'This month'], ['last', 'Last month'], ['all', 'All time']].map(([k, l]) => `<button class="chip ${ui.range === k ? 'on' : ''}" data-act="range" data-v="${k}">${l}</button>`).join('')}</div>
     <div class="two" style="margin-top:12px"><label>From<input class="in" type="date" id="from" value="${ui.from}"></label><label>To<input class="in" type="date" id="to" value="${ui.to}"></label></div></div>
-  <div class="stats"><div class="stat big"><b>${r.label}</b><span>${r.hours} hours total · ${r.from} → ${r.to}</span></div><div class="stat"><b>${r.sessions}</b><span>Sessions</span></div><div class="stat"><b>${r.byDay.length}</b><span>Days worked</span></div></div>
+  <div class="stats"><div class="stat big"><b>${r.label}</b><span>${r.hours} hours total · ${r.from} → ${r.to}</span></div>${r.earnings ? `<div class="stat"><b>${cur} ${r.earnings.toLocaleString()}</b><span>Earnings</span></div>` : ''}<div class="stat"><b>${r.sessions}</b><span>Sessions</span></div><div class="stat"><b>${r.byDay.length}</b><span>Days worked</span></div></div>
   <div class="panel"><h2>By school</h2>${bars(r.bySchool)}</div><div class="panel"><h2>By class</h2>${bars(r.byClass)}</div>
   <div class="panel"><h2>By day</h2>${bars(r.byDay, 31)}</div>
   <div class="row"><button class="btn pri" data-act="w-line">Send to LINE</button><button class="btn" data-act="w-csv">Copy CSV</button></div>
@@ -111,6 +116,24 @@ function workPage() {
   const q = new URLSearchParams((location.hash.split('?')[1]) || '');
   if (q.get('add')) ui.tab = 'log';
   return `<div class="wrap narrow"><h1 class="pg">📝 Work Hours</h1><div class="seg"><button class="${ui.tab === 'log' ? 'on' : ''}" data-act="tab" data-v="log">Log hours</button><button class="${ui.tab === 'detail' ? 'on' : ''}" data-act="tab" data-v="detail">Details</button></div>${ui.tab === 'log' ? logTab() : detailTab()}</div>`;
+}
+
+/* ---------- home ---------- */
+function homePage() {
+  const now = Date.now(), set = S.settings, cur = set.currency || '';
+  const next = S.reminders.filter(r => !r.done && !r.sent && r.at > now).sort((a, b) => a.at - b.at);
+  const today = ymd(new Date()), [wf, wt] = rangePreset('week'), [mf, mt] = rangePreset('month');
+  const td = report(S.work, today, today, set.rates), wk = report(S.work, wf, wt, set.rates), mo = report(S.work, mf, mt, set.rates);
+  const hr = new Date().getHours(), greet = hr < 5 ? 'Good night' : hr < 12 ? 'Good morning' : hr < 18 ? 'Good afternoon' : 'Good evening';
+  const days = new Set(S.work.map(w => w.date)); let streak = 0; const d = new Date(); if (!days.has(ymd(d))) d.setDate(d.getDate() - 1);
+  while (days.has(ymd(d))) { streak++; d.setDate(d.getDate() - 1); }
+  const money = r => r.earnings ? `<span>${cur} ${r.earnings.toLocaleString()}</span>` : '';
+  return `<div class="wrap narrow"><h1 class="pg">${greet} 👋</h1>
+  <div class="stats"><div class="stat big sm"><b>${next[0] ? esc(next[0].title) : 'No upcoming reminders'}</b><span>${next[0] ? fmtWhen(next[0].at) + ' · ' + rel(next[0].at) : 'Add one from the Reminders tab'}</span></div>
+  <div class="stat"><b>${td.label}</b><span>Today</span>${money(td)}</div><div class="stat"><b>${wk.label}</b><span>This week</span>${money(wk)}</div><div class="stat"><b>${mo.label}</b><span>This month</span>${money(mo)}</div><div class="stat"><b>${streak} 🔥</b><span>Day streak</span></div></div>
+  <div class="row" style="margin:14px 0"><a class="btn pri" href="#/work?add=1">＋ Log hours</a><a class="btn" href="#/reminders">＋ New reminder</a></div>
+  <h2 class="sec">Next up</h2><ul class="list">${next.slice(0, 5).map(reminderRow).join('') || '<li class="empty">Nothing scheduled.</li>'}</ul>
+  <h2 class="sec">Recent hours</h2><ul class="list">${[...S.work].sort((a, b) => (b.date + b.start).localeCompare(a.date + a.start)).slice(0, 5).map(e => entryRow(e, false)).join('') || '<li class="empty">No hours logged yet.</li>'}</ul></div>`;
 }
 
 /* ---------- settings ---------- */
@@ -125,7 +148,16 @@ function settingsPage() {
     ${isNative() ? '<p class="mut sm">The Android app schedules reminders on your phone, so they ring even when it\'s closed.</p>' : '<p class="mut sm">On iPhone, first Add this app to your Home Screen, then enable notifications.</p>'}
     <div class="row"><button class="btn pri" data-act="enable-push">Enable notifications</button><button class="btn" data-act="test">Send test (phone + LINE)</button></div>
     ${S.line ? '' : '<p class="mut sm" style="margin-top:12px">To connect LINE, add <code>LINE_CHANNEL_ACCESS_TOKEN</code> and <code>LINE_USER_ID</code> in Vercel → this Vercel project → Settings → Environment Variables, then redeploy.</p>'}</div>
+  <div class="panel"><h2>Hourly rates &amp; weekly report</h2><p class="mut sm">Set your hourly rate per school to see earnings in Details and on LINE.</p>
+    <label>Currency symbol<input class="in" id="cur" maxlength="6" value="${esc(s.currency)}"></label>
+    ${s.schools.map(x => `<label>${esc(x)} — per hour<input class="in rate" data-school="${esc(x)}" type="number" min="0" step="any" inputmode="decimal" value="${s.rates?.[x] || ''}" placeholder="0"></label>`).join('') || '<p class="mut sm">Add a school first by logging hours.</p>'}
+    <label class="sw"><input type="checkbox" id="wOn" ${s.weeklyOn ? 'checked' : ''}> Send me a weekly hours report on LINE (Sunday)</label>
+    <label>Weekly report time<input class="in" type="time" id="wTime" value="${s.weeklyTime || '20:00'}"></label>
+    <button class="btn pri" data-act="save-rates">Save</button></div>
   <div class="panel"><h2>Schools</h2><div class="tagrow">${chipList(s.schools, 'school')}</div><h2 style="margin-top:18px">Classes</h2><div class="tagrow">${chipList(s.classes, 'class')}</div></div>
+  <div class="panel"><h2>Backup</h2><p class="mut sm">Download everything as a file, or restore from one.</p>
+    <div class="row"><button class="btn" data-act="export">Download backup</button><label class="btn" style="cursor:pointer">Restore<input type="file" id="imp" accept="application/json" hidden></label></div></div>
+  <div class="panel"><h2>App</h2><p class="mut sm">Version ${window.__VER || 'live'} · the app updates itself automatically.</p><button class="btn" data-act="update">Check for updates</button></div>
   <div class="panel"><button class="btn" data-act="lock">Lock (forget PIN on this device)</button></div></div>`;
 }
 
@@ -149,13 +181,23 @@ document.addEventListener('click', async e => {
   try {
     if (a === 'r-del' && confirm('Delete this reminder?')) { await api('reminder-delete', { id }); await loadState(); refresh(); }
     else if (a === 'r-done') { await api('reminder-done', { id }); await loadState(); refresh(); }
+    else if (a === 'r-snooze') { await api('reminder-snooze', { id, minutes: 60 }); await loadState(); toast('Snoozed 1 hour'); refresh(); }
+    else if (a === 'save-rates') {
+      const rates = {}; document.querySelectorAll('.rate').forEach(i => { if (Number(i.value) > 0) rates[i.dataset.school] = Number(i.value); });
+      const j = await api('settings-save', { rates, currency: $('#cur').value.trim(), weeklyOn: $('#wOn').checked, weeklyTime: $('#wTime').value }); S.settings = j.settings; toast('Saved');
+    }
+    else if (a === 'export') {
+      const blob = new Blob([JSON.stringify({ app: 'kanwar-reminders', at: Date.now(), reminders: S.reminders, work: S.work, settings: S.settings }, null, 2)], { type: 'application/json' });
+      const l = document.createElement('a'); l.href = URL.createObjectURL(blob); l.download = `reminders-backup-${ymd(new Date())}.json`; l.click(); setTimeout(() => URL.revokeObjectURL(l.href), 5000);
+    }
+    else if (a === 'update') { const { checkUpdate } = await import('./update.js'); toast(await checkUpdate(true)); }
     else if (a === 'r-edit') { ui.editing = id; refresh(); scrollTo({ top: 0, behavior: 'smooth' }); }
     else if (a === 'r-cancel') { ui.editing = null; refresh(); }
     else if (a === 'tab') { ui.tab = t.dataset.v; history.replaceState(null, '', '#/work'); refresh(); }
     else if (a === 'range') { ui.range = t.dataset.v; [ui.from, ui.to] = rangePreset(ui.range); refresh(); }
     else if (a === 'w-del' && confirm('Delete this entry?')) { await api('work-delete', { id }); await loadState(); refresh(); }
     else if (a === 'w-line') { const r = await api('work-report', { from: ui.from, to: ui.to, line: true }); toast(r.ok ? 'Sent to LINE' : (r.error || 'LINE not connected')); }
-    else if (a === 'w-csv') { await navigator.clipboard.writeText(toCSV(report(S.work, ui.from, ui.to).entries)); toast('CSV copied'); }
+    else if (a === 'w-csv') { await navigator.clipboard.writeText(toCSV(report(S.work, ui.from, ui.to, S.settings.rates).entries)); toast('CSV copied'); }
     else if (a === 'save-set') {
       const j = await api('settings-save', { workPromptOn: $('#pOn').checked, workPromptTime: $('#pTime').value, tz: $('#tz').value.trim() }); S.settings = j.settings; toast('Saved');
     }
@@ -171,7 +213,7 @@ document.addEventListener('submit', async e => {
   if (e.target.id === 'rf') {
     e.preventDefault(); const f = new FormData(e.target);
     try {
-      await api('reminder-save', { id: ui.editing || undefined, title: f.get('title'), detail: f.get('detail'), at: new Date(f.get('at')).getTime(), repeat: f.get('repeat') });
+      await api('reminder-save', { id: ui.editing || undefined, title: f.get('title'), detail: f.get('detail'), at: new Date(f.get('at')).getTime(), repeat: f.get('repeat'), lead: Number(f.get('lead')) });
       ui.editing = null; await loadState(); toast('Reminder saved'); refresh();
     } catch (err) { toast(err.message); }
   } else if (e.target.id === 'wf') {
@@ -183,7 +225,11 @@ document.addEventListener('submit', async e => {
     } catch (err) { toast(err.message); }
   }
 });
-document.addEventListener('change', e => {
+document.addEventListener('change', async e => {
+  if (e.target.id === 'imp' && e.target.files[0]) {
+    try { const d = JSON.parse(await e.target.files[0].text()); const r = await api('import', { reminders: d.reminders, work: d.work }); await loadState(); toast(`Restored ${r.imported} items`); refresh(); } catch (err) { toast('Could not restore: ' + err.message); }
+    return;
+  }
   if (e.target.id === 'sch' || e.target.id === 'cls') { const n = $(e.target.id === 'sch' ? '#schNew' : '#clsNew'); n.classList.toggle('hide', e.target.value !== '__new'); n.required = e.target.value === '__new'; }
   if (e.target.id === 'from' || e.target.id === 'to') { ui.from = $('#from').value; ui.to = $('#to').value; ui.range = ''; if (ui.from && ui.to && ui.from <= ui.to) refresh(); }
   durUpdate();
@@ -196,11 +242,11 @@ function durUpdate() {
 
 /* ---------- mount ---------- */
 export async function mount(root, hash) {
-  const page = (hash.match(/^#\/(reminders|work|settings)/) || [])[1];
+  const page = (hash.match(/^#\/(home|reminders|work|settings)/) || [])[1];
   root.innerHTML = '<div class="wrap narrow"><div class="empty">Loading…</div></div>';
   root.id = 'view';
   if (!(await gate(root))) return;
-  root.innerHTML = page === 'reminders' ? remindersPage() : page === 'work' ? workPage() : settingsPage();
+  root.innerHTML = page === 'home' ? homePage() : page === 'reminders' ? remindersPage() : page === 'work' ? workPage() : settingsPage();
   durUpdate();
 }
 
@@ -226,9 +272,9 @@ function ring() { try { navigator.vibrate?.([300, 150, 300, 150, 600]); } catch 
 function alarm(r) {
   ring();
   const d = document.createElement('dialog'); d.className = 'alarm';
-  d.innerHTML = `<h3>⏰ ${esc(r.title)}</h3>${r.detail ? `<p>${esc(r.detail)}</p>` : ''}<p class="mut">${fmtWhen(r.at)}</p><div class="row"><button class="btn pri" data-x="done">Mark done</button><button class="btn" data-x="close">Dismiss</button></div>`;
+  d.innerHTML = `<h3>⏰ ${esc(r.title)}</h3>${r.detail ? `<p>${esc(r.detail)}</p>` : ''}<p class="mut">${fmtWhen(r.at)}</p><div class="row"><button class="btn pri" data-x="done">Mark done</button><button class="btn" data-x="s10">Snooze 10 min</button><button class="btn" data-x="s60">Snooze 1 h</button><button class="btn" data-x="close">Dismiss</button></div>`;
   document.body.append(d); d.showModal();
-  d.onclick = async ev => { const x = ev.target.dataset.x; if (!x) return; if (x === 'done') { try { await api('reminder-done', { id: r.id }); await loadState(); } catch { /* ignore */ } } d.close(); d.remove(); };
+  d.onclick = async ev => { const x = ev.target.dataset.x; if (!x) return; if (x === 'done') { try { await api('reminder-done', { id: r.id }); await loadState(); } catch { /* ignore */ } } else if (x === 's10' || x === 's60') { try { await api('reminder-snooze', { id: r.id, minutes: x === 's10' ? 10 : 60 }); await loadState(); toast('Snoozed'); } catch { /* ignore */ } } d.close(); d.remove(); };
   if ('Notification' in window && Notification.permission === 'granted' && document.hidden) navigator.serviceWorker?.ready.then(reg => reg.showNotification('⏰ ' + r.title, { body: r.detail || '', vibrate: [300, 150, 300], tag: r.id }));
 }
 function promptWork() {
