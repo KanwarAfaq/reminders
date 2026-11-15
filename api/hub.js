@@ -3,7 +3,7 @@ import {
   partsInTz, minutes, durationMin, fmtHours, nextRepeat, lineReady, sendLine, reminderCard, workPromptCard, reportCard, pushAll, HUB_URL,
 } from './_lib.js';
 
-const DEFAULTS = { tz: 'Asia/Taipei', workPromptTime: '19:00', workPromptOn: true, schools: [], classes: [], rates: {}, currency: 'NT$', weeklyOn: true, weeklyTime: '20:00' };
+const DEFAULTS = { tz: 'Asia/Taipei', workPromptTime: '19:00', workPromptOn: true, schools: [], classes: [], rates: {}, currency: 'NT$', weeklyOn: true, weeklyTime: '20:00', followUp: true };
 const send = (res, code, body) => { res.setHeader('Cache-Control', 'no-store'); res.status(code).json(body); };
 const clean = (s, n) => String(s ?? '').trim().slice(0, n);
 const isDate = s => /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -24,26 +24,44 @@ export function buildReport(entries, from, to, rates = {}, currency = '') {
     bySchool: group('school').map(x => ({ ...x, earn: list.filter(e => e.school === x.name).reduce((a, e) => a + earn(e), 0) })), byClass: group('classKey'), byDay, entries: list.sort((a, b) => (a.date + a.start).localeCompare(b.date + b.start)) };
 }
 
+// Atomic "first caller wins" so the cron job and the app can never send the same alert twice.
+const claim = async key => (await redis('SETNX', key, '1')) === 1 && (await redis('EXPIRE', key, 3 * 86400), true);
+export function rollForward(at, repeat, now) {
+  let n = nextRepeat(at, repeat), guard = 0;
+  while (n && n <= now && guard++ < 5000) n = nextRepeat(n, repeat);
+  return n;
+}
+const FOLLOW_MIN = 30;
+
 export async function tick(now = Date.now()) {
   const out = { reminders: 0, prompted: false };
   const settings = { ...DEFAULTS, ...(await getJSON('hub:settings', {})) };
+  // Collect everything due this minute, then send ONE LINE message and ONE push for the lot.
+  const items = [];
   for (const r of await hgetall('hub:reminders')) {
-    if (r.done || r.sent) continue;
+    if (r.done) continue;
     const lead = Number(r.lead) || 0;
-    if (lead && !r.earlySent && r.at > now && r.at - lead * 60000 <= now) {
-      const mins = Math.max(1, Math.round((r.at - now) / 60000));
-      await sendLine(reminderCard({ ...r, title: `In ${mins} min: ${r.title}` }, settings.tz));
-      await pushAll({ title: `⏳ In ${mins} min: ${r.title}`, body: r.detail || 'Upcoming reminder', tag: r.id + '-early', url: '/#/reminders', vibrate: [200, 100, 200] });
-      await hset('hub:reminders', r.id, { ...r, earlySent: now });
-      out.early = (out.early || 0) + 1; continue;
+    if (!r.sent && r.at > now && lead && !r.earlySent && r.at - lead * 60000 <= now) {
+      if (await claim(`hub:c:${r.id}:${r.at}:e`)) { items.push({ kind: 'early', r }); await hset('hub:reminders', r.id, { ...r, earlySent: now }); out.early = (out.early || 0) + 1; }
+    } else if (!r.sent && r.at <= now) {
+      if (!(await claim(`hub:c:${r.id}:${r.at}`))) continue;
+      items.push({ kind: 'due', r });
+      const next = rollForward(r.at, r.repeat, now);
+      // One-off reminders are marked sent; repeating ones jump straight to their next future occurrence.
+      await hset('hub:reminders', r.id, next ? { ...r, at: next, lastSent: now, earlySent: 0 } : { ...r, sent: now, sentAt: r.at });
+      out.reminders++;
+    } else if (r.sent && !r.followed && settings.followUp && now - r.sent >= FOLLOW_MIN * 60000 && now - r.sent < 12 * 3600e3) {
+      if (await claim(`hub:c:${r.id}:${r.sentAt || r.at}:f`)) { items.push({ kind: 'follow', r }); await hset('hub:reminders', r.id, { ...r, followed: now }); out.followUps = (out.followUps || 0) + 1; }
     }
-    if (r.at > now) continue;
-    const line = await sendLine(reminderCard(r, settings.tz));
-    const pushed = await pushAll({ title: `⏰ ${r.title}`, body: r.detail || 'Reminder', tag: r.id, url: '/#/reminders', vibrate: [300, 150, 300, 150, 600] });
-    const next = nextRepeat(r.at, r.repeat);
-    // Repeating reminders roll forward; one-off reminders are marked sent so they never fire twice.
-    await hset('hub:reminders', r.id, next ? { ...r, at: Math.max(next, now + 60000), lastSent: now, earlySent: 0 } : { ...r, sent: now, lineOk: line.ok, lineError: line.error, pushed });
-    out.reminders++;
+  }
+  if (items.length) {
+    const label = { early: x => `In ${Math.max(1, Math.round((x.r.at - now) / 60000))} min: ${x.r.title}`, due: x => x.r.title, follow: x => `Still pending: ${x.r.title}` };
+    const cards = items.slice(0, 10).map(x => reminderCard({ ...x.r, title: label[x.kind](x) }, settings.tz).contents);
+    const alt = items.length === 1 ? `⏰ ${label[items[0].kind](items[0])}` : `⏰ ${items.length} reminders`;
+    const line = await sendLine({ type: 'flex', altText: alt, contents: cards.length === 1 ? cards[0] : { type: 'carousel', contents: cards } });
+    const lone = items.length === 1;
+    out.pushed = await pushAll({ title: lone ? `⏰ ${label[items[0].kind](items[0])}` : `⏰ ${items.length} reminders`, body: lone ? (items[0].r.detail || 'Reminder') : items.map(x => x.r.title).join(' · ').slice(0, 180), tag: 'reminders', url: '/#/reminders', vibrate: [300, 150, 300, 150, 600] });
+    out.line = line.ok;
   }
   if (settings.workPromptOn) {
     const { date, hm } = partsInTz(now, settings.tz);
@@ -117,7 +135,7 @@ export default async function handler(req, res) {
         const r = (await hgetall('hub:reminders')).find(x => x.id === body.id);
         if (!r) return send(res, 404, { error: 'Reminder not found' });
         const m = Math.min(Math.max(Number(body.minutes) || 10, 1), 1440);
-        await hset('hub:reminders', r.id, { ...r, at: Date.now() + m * 60000, sent: 0, done: false, earlySent: 0 });
+        await hset('hub:reminders', r.id, { ...r, at: Date.now() + m * 60000, sent: 0, done: false, earlySent: 0, followed: 0 });
         return send(res, 200, { ok: true });
       }
       case 'reminder-delete': await hdel('hub:reminders', clean(body.id, 40)); return send(res, 200, { ok: true });
@@ -152,6 +170,7 @@ export default async function handler(req, res) {
         if (body.rates && typeof body.rates === 'object') next.rates = Object.fromEntries(Object.entries(body.rates).map(([k, v]) => [clean(k, 80), Math.min(Math.max(Number(v) || 0, 0), 1e6)]).filter(([k, v]) => k && v > 0));
         if (typeof body.currency === 'string') next.currency = clean(body.currency, 6);
         if (typeof body.weeklyOn === 'boolean') next.weeklyOn = body.weeklyOn;
+        if (typeof body.followUp === 'boolean') next.followUp = body.followUp;
         if (isHM(body.weeklyTime)) next.weeklyTime = body.weeklyTime;
         await setJSON('hub:settings', next);
         return send(res, 200, { ok: true, settings: next });

@@ -143,3 +143,8 @@ ol{color:var(--mut)}
 .tabn.on{background:rgba(99,102,241,.22);color:#fff}
 .stat span+span{display:block;margin-top:2px;color:#34d399;font-weight:600}
 .stat.big.sm b{font-size:22px;line-height:1.25}
+.chips.q{margin:2px 0 8px}
+details.more{margin:6px 0 10px}details.more summary,details.adv summary{cursor:pointer;font-weight:700;color:var(--mut,#94a3b8);padding:6px 0}
+details.adv summary{font-size:17px;color:inherit}details.adv[open] summary{margin-bottom:10px}
+.err{color:#fb7185}
+.chips.q{flex-wrap:wrap;overflow:visible}

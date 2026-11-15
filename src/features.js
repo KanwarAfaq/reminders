@@ -2,7 +2,7 @@ import { api, getKey, setKey } from './api.js';
 import { S, esc, ymd, hm, toLocalInput, durationMin, fmtHours, fmtWhen, rel, report, rangePreset, toCSV, pad } from './store.js';
 
 const $ = (s, r = document) => r.querySelector(s);
-let cfg = null, ui = { tab: 'log', range: 'month', from: '', to: '', editing: null };
+let cfg = null, ui = { nat: null, tab: 'log', range: 'month', from: '', to: '', editing: null };
 export const toast = t => { const d = document.createElement('div'); d.className = 'toast'; d.textContent = t; document.body.append(d); setTimeout(() => d.remove(), 2600); };
 const isNative = () => !!window.Capacitor?.isNativePlatform?.();
 
@@ -15,20 +15,53 @@ export async function loadState() {
 }
 export const hasKey = () => !!getKey();
 
-async function syncNative() {
-  if (!isNative()) return;
-  try {
+let nativeReady = null;
+async function native() {
+  if (!isNative()) return null;
+  nativeReady ||= (async () => {
     const { LocalNotifications: L } = await import('@capacitor/local-notifications');
-    if ((await L.requestPermissions()).display !== 'granted') return;
-    const pend = await L.getPending(); if (pend.notifications.length) await L.cancel({ notifications: pend.notifications });
-    const hash = s => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7) & 0x7fffffff;
-    const live = S.reminders.filter(r => !r.done && !r.sent).slice(0, 60);
+    try { await L.createChannel({ id: 'reminders', name: 'Reminders', description: 'Reminder alarms', importance: 5, visibility: 1, vibration: true, lights: true }); } catch { /* older Android */ }
+    L.addListener('localNotificationActionPerformed', () => { if (!location.hash.startsWith('#/reminders')) location.hash = '#/reminders'; });
+    return L;
+  })();
+  try { return await nativeReady; } catch { return null; }
+}
+export async function nativeStatus() {
+  const L = await native(); if (!L) return null;
+  const out = { display: (await L.checkPermissions()).display, exact: 'granted' };
+  try { out.exact = (await L.checkExactNotificationSetting()).exact_alarm; } catch { /* not needed on this Android */ }
+  return out;
+}
+async function ensureNativePermission(ask) {
+  const L = await native(); if (!L) return false;
+  let st = await nativeStatus();
+  if (st.display !== 'granted' && ask) st = { ...st, display: (await L.requestPermissions()).display };
+  if (st.exact !== 'granted' && ask) { try { await L.changeExactNotificationSetting(); } catch { /* ignore */ } }
+  return st.display === 'granted';
+}
+const hash31 = s => [...s].reduce((a, c) => (a * 31 + c.charCodeAt(0)) | 0, 7) & 0x7fffffff;
+export async function syncNative(force = false) {
+  try {
+    const L = await native(); if (!L) return;
+    if (!(await ensureNativePermission(false))) return;
+    const live = S.reminders.filter(r => !r.done && !r.sent).slice(0, 60), now = Date.now();
     const items = [
-      ...live.filter(r => r.at > Date.now()).map(r => ({ id: hash(r.id), title: '⏰ ' + r.title, body: r.detail || 'Reminder', schedule: { at: new Date(r.at), allowWhileIdle: true }, extra: { id: r.id } })),
-      ...live.filter(r => r.lead && !r.earlySent && r.at - r.lead * 60000 > Date.now()).map(r => ({ id: hash(r.id + 'e'), title: `⏳ In ${r.lead >= 60 ? r.lead / 60 + ' h' : r.lead + ' min'}: ${r.title}`, body: r.detail || 'Upcoming reminder', schedule: { at: new Date(r.at - r.lead * 60000), allowWhileIdle: true }, extra: { id: r.id } })),
+      ...live.filter(r => r.at > now).map(r => ({ id: hash31(r.id), title: '⏰ ' + r.title, body: r.detail || 'Reminder', channelId: 'reminders', schedule: { at: new Date(r.at), allowWhileIdle: true }, extra: { id: r.id } })),
+      ...live.filter(r => r.lead && !r.earlySent && r.at - r.lead * 60000 > now).map(r => ({ id: hash31(r.id + 'e'), title: `⏳ In ${r.lead >= 60 ? r.lead / 60 + ' h' : r.lead + ' min'}: ${r.title}`, body: r.detail || 'Upcoming reminder', channelId: 'reminders', schedule: { at: new Date(r.at - r.lead * 60000), allowWhileIdle: true }, extra: { id: r.id } })),
     ];
+    // Only touch the phone's alarms when something actually changed.
+    const sig = items.map(i => i.id + '@' + i.schedule.at.getTime()).sort().join(',');
+    if (!force && localStorage.getItem('rem.sig') === sig) return;
+    const pend = await L.getPending(); if (pend.notifications.length) await L.cancel({ notifications: pend.notifications });
     if (items.length) await L.schedule({ notifications: items });
+    localStorage.setItem('rem.sig', sig);
   } catch { /* plugin unavailable */ }
+}
+async function testNative() {
+  const L = await native(); if (!L) return false;
+  if (!(await ensureNativePermission(true))) { toast('Allow notifications for this app in Android settings'); return false; }
+  await L.schedule({ notifications: [{ id: 999001, title: '🔔 Test alarm', body: 'Phone alarms work.', channelId: 'reminders', schedule: { at: new Date(Date.now() + 10000), allowWhileIdle: true } }] });
+  toast('Test alarm in 10 seconds — you can lock the phone'); return true;
 }
 
 /* ---------- unlock gate ---------- */
@@ -71,11 +104,13 @@ function remindersPage() {
   return `<div class="wrap narrow"><h1 class="pg">⏰ Reminders</h1>
   <form class="panel" id="rf"><h2>${e ? 'Edit reminder' : 'New reminder'}</h2>
     <label>Title<input class="in" name="title" maxlength="120" required value="${esc(e?.title)}" placeholder="e.g. Parent meeting"></label>
-    <label>Details<textarea class="in" name="detail" rows="3" maxlength="1000" placeholder="Optional notes">${esc(e?.detail)}</textarea></label>
-    <div class="two"><label>Date &amp; time<input class="in" type="datetime-local" name="at" required value="${toLocalInput(def)}"></label>
-    <label>Repeat<select class="in" name="repeat">${['none', 'daily', 'weekly'].map(v => `<option value="${v}" ${e?.repeat === v ? 'selected' : ''}>${v === 'none' ? 'Does not repeat' : v[0].toUpperCase() + v.slice(1)}</option>`).join('')}</select></label></div>
-    <label>Early alert<select class="in" name="lead">${LEADS.map(([v, l]) => `<option value="${v}" ${(e?.lead || 0) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-    <p class="mut sm">You'll get an in-app alert with vibration, a phone notification${S.line ? ' and a LINE card' : ''} at that time.</p>
+    <label>Date &amp; time<input class="in" type="datetime-local" name="at" required value="${toLocalInput(def)}"></label>
+    <div class="chips q">${[['10', 'In 10 min'], ['60', 'In 1 hour'], ['eve', 'This evening'], ['tom', 'Tomorrow 9am']].map(([k, l]) => `<button type="button" class="chip" data-act="quick" data-v="${k}">${l}</button>`).join('')}</div>
+    <details class="more" ${e && (e.detail || e.repeat !== 'none' || e.lead) ? 'open' : ''}><summary>More options</summary>
+      <label>Details<textarea class="in" name="detail" rows="2" maxlength="1000" placeholder="Optional notes">${esc(e?.detail)}</textarea></label>
+      <div class="two"><label>Repeat<select class="in" name="repeat">${['none', 'daily', 'weekly'].map(v => `<option value="${v}" ${e?.repeat === v ? 'selected' : ''}>${v === 'none' ? 'Does not repeat' : v[0].toUpperCase() + v.slice(1)}</option>`).join('')}</select></label>
+      <label>Early alert<select class="in" name="lead">${LEADS.map(([v, l]) => `<option value="${v}" ${(e?.lead || 0) === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+    </details>
     <div class="row"><button class="btn pri">${e ? 'Save changes' : 'Add reminder'}</button>${e ? '<button type="button" class="btn" data-act="r-cancel">Cancel</button>' : ''}</div></form>
   <h2 class="sec">Upcoming (${up.length})</h2><ul class="list">${up.map(reminderRow).join('') || '<li class="empty">Nothing scheduled.</li>'}</ul>
   ${past.length ? `<h2 class="sec">Past</h2><ul class="list">${past.slice(0, 20).map(reminderRow).join('')}</ul>` : ''}</div>`;
@@ -84,18 +119,19 @@ function remindersPage() {
 /* ---------- work hours ---------- */
 const opts = (list, sel) => list.map(x => `<option ${x === sel ? 'selected' : ''}>${esc(x)}</option>`).join('') + '<option value="__new">＋ Add new…</option>';
 function entryRow(e, del = true) {
-  return `<li class="item"><div class="grow"><b>${esc(e.school)}</b> · ${esc(e.class)}<div class="mut sm">${e.date} · ${e.start}–${e.end}${e.note ? ' · ' + esc(e.note) : ''}</div></div><b class="hrs">${fmtHours(e.minutes)}</b>${del ? `<div class="acts"><button class="mini" data-act="w-del" data-id="${e.id}" title="Delete">🗑</button></div>` : ''}</li>`;
+  return `<li class="item"><div class="grow"><b>${esc(e.school)}</b> · ${esc(e.class)}<div class="mut sm">${e.date} · ${e.start}–${e.end}${e.note ? ' · ' + esc(e.note) : ''}</div></div><b class="hrs">${fmtHours(e.minutes)}</b> ${del ? `<div class="acts"><button class="mini" data-act="w-edit" data-id="${e.id}" title="Edit">✎</button><button class="mini" data-act="w-del" data-id="${e.id}" title="Delete">🗑</button></div>` : ''}</li>`;
 }
-function logTab(prefill = {}) {
+function logTab() {
+  const prefill = ui.prefill || {}; ui.prefill = null;
   const today = ymd(new Date()), set = S.settings, todays = S.work.filter(w => w.date === today).sort((a, b) => a.start.localeCompare(b.start));
   const sum = todays.reduce((a, e) => a + e.minutes, 0);
-  return `<form class="panel" id="wf"><h2>Log working hours</h2>
+  return `<form class="panel" id="wf"><h2>${ui.editWork ? 'Edit entry' : 'Log working hours'}</h2>${S.work.length ? '<button type="button" class="btn" data-act="same-last" style="margin-bottom:6px">↻ Same as last time</button>' : ''}
     <label>Date<input class="in" type="date" name="date" value="${prefill.date || today}" required></label>
     <div class="two"><label>School<select class="in" name="school" id="sch">${opts(set.schools, prefill.school)}</select><input class="in ${set.schools.length || prefill.school ? 'hide' : ''}" id="schNew" placeholder="Type school name" maxlength="80" ${set.schools.length ? '' : 'required'} style="margin-top:8px"></label>
     <label>Class<select class="in" name="class" id="cls">${opts(set.classes, prefill.class)}</select><input class="in ${set.classes.length || prefill.class ? 'hide' : ''}" id="clsNew" placeholder="Type class name" maxlength="80" ${set.classes.length ? '' : 'required'} style="margin-top:8px"></label></div>
     <div class="two"><label>From<input class="in" type="time" name="start" value="${prefill.start || '16:30'}" required></label><label>To<input class="in" type="time" name="end" value="${prefill.end || '18:30'}" required></label></div>
     <div class="dur">Duration: <b id="dur">–</b></div>
-    <label>Note (optional)<input class="in" name="note" maxlength="300"></label>
+    <label>Note (optional)<input class="in" name="note" maxlength="300" value="${esc(prefill.note)}"></label>
     <button class="btn pri">Save</button></form>
   <h2 class="sec">Today · ${fmtHours(sum)}</h2><ul class="list">${todays.map(e => entryRow(e)).join('') || '<li class="empty">Nothing logged today yet.</li>'}</ul>`;
 }
@@ -140,31 +176,36 @@ function homePage() {
 const chipList = (arr, kind) => arr.map(x => `<span class="tagx">${esc(x)}<button data-act="rm-${kind}" data-v="${esc(x)}" aria-label="Remove">×</button></span>`).join('') || '<span class="mut sm">None yet — they are added when you log hours.</span>';
 function settingsPage() {
   const s = S.settings, perm = 'Notification' in window ? Notification.permission : 'unsupported';
+  const nat = isNative(), ok = nat ? ui.nat : perm;
+  const status = nat ? (!ui.nat ? 'checking…' : ui.nat.display !== 'granted' ? '<b class="err">blocked — tap Enable</b>' : ui.nat.exact !== 'granted' ? '<b class="err">allow “Alarms &amp; reminders” for exact timing</b>' : '<b>on</b>')
+    : perm === 'granted' ? '<b>on</b>' : perm === 'denied' ? '<b class="err">blocked in browser settings</b>' : perm === 'unsupported' ? 'not supported here' : '<b>not enabled</b>';
   return `<div class="wrap narrow"><h1 class="pg">⚙️ Settings</h1>
+  <div class="panel"><h2>Notifications</h2><p class="mut">Phone alerts: ${status} · LINE: <b>${S.line ? 'connected' : 'not connected'}</b></p>
+    <div class="row"><button class="btn pri" data-act="enable-push">Enable</button><button class="btn" data-act="${nat ? 'test-native' : 'test'}">${nat ? 'Test alarm (10 s)' : 'Send test'}</button>${nat ? '<button class="btn" data-act="test">Test LINE</button>' : ''}</div>
+    <label class="sw" style="margin-top:14px"><input type="checkbox" id="fOn" ${s.followUp !== false ? 'checked' : ''} data-act="save-follow"> One follow-up if I haven't marked it done after 30 min</label>
+    ${nat ? '' : '<p class="mut sm">On iPhone, first Add this app to your Home Screen. For alarms that ring on time even offline, use the Android app.</p>'}
+    ${S.line ? '' : '<p class="mut sm">To connect LINE, add <code>LINE_CHANNEL_ACCESS_TOKEN</code> and <code>LINE_USER_ID</code> in Vercel → this project → Settings → Environment Variables, then redeploy.</p>'}</div>
   <div class="panel"><h2>Evening check-in</h2><label class="sw"><input type="checkbox" id="pOn" ${s.workPromptOn ? 'checked' : ''}> Ask me to log working hours every evening</label>
     <label>Time<input class="in" type="time" id="pTime" value="${s.workPromptTime}"></label><label>Time zone<input class="in" id="tz" value="${esc(s.tz)}"></label>
     <button class="btn pri" data-act="save-set">Save</button></div>
-  <div class="panel"><h2>Notifications</h2><p class="mut">Status: <b>${perm === 'granted' ? 'enabled' : perm === 'denied' ? 'blocked in browser settings' : perm === 'unsupported' ? 'not supported here' : 'not enabled'}</b>. LINE: <b>${S.line ? 'connected' : 'not connected'}</b>.</p>
-    ${isNative() ? '<p class="mut sm">The Android app schedules reminders on your phone, so they ring even when it\'s closed.</p>' : '<p class="mut sm">On iPhone, first Add this app to your Home Screen, then enable notifications.</p>'}
-    <div class="row"><button class="btn pri" data-act="enable-push">Enable notifications</button><button class="btn" data-act="test">Send test (phone + LINE)</button></div>
-    ${S.line ? '' : '<p class="mut sm" style="margin-top:12px">To connect LINE, add <code>LINE_CHANNEL_ACCESS_TOKEN</code> and <code>LINE_USER_ID</code> in Vercel → this Vercel project → Settings → Environment Variables, then redeploy.</p>'}</div>
-  <div class="panel"><h2>Hourly rates &amp; weekly report</h2><p class="mut sm">Set your hourly rate per school to see earnings in Details and on LINE.</p>
+  <details class="panel adv"><summary>Advanced</summary>
+    <h2>Hourly rates &amp; weekly report</h2><p class="mut sm">Set your hourly rate per school to see earnings in Details and on LINE.</p>
     <label>Currency symbol<input class="in" id="cur" maxlength="6" value="${esc(s.currency)}"></label>
     ${s.schools.map(x => `<label>${esc(x)} — per hour<input class="in rate" data-school="${esc(x)}" type="number" min="0" step="any" inputmode="decimal" value="${s.rates?.[x] || ''}" placeholder="0"></label>`).join('') || '<p class="mut sm">Add a school first by logging hours.</p>'}
     <label class="sw"><input type="checkbox" id="wOn" ${s.weeklyOn ? 'checked' : ''}> Send me a weekly hours report on LINE (Sunday)</label>
     <label>Weekly report time<input class="in" type="time" id="wTime" value="${s.weeklyTime || '20:00'}"></label>
-    <button class="btn pri" data-act="save-rates">Save</button></div>
-  <div class="panel"><h2>Schools</h2><div class="tagrow">${chipList(s.schools, 'school')}</div><h2 style="margin-top:18px">Classes</h2><div class="tagrow">${chipList(s.classes, 'class')}</div></div>
-  <div class="panel"><h2>Backup</h2><p class="mut sm">Download everything as a file, or restore from one.</p>
-    <div class="row"><button class="btn" data-act="export">Download backup</button><label class="btn" style="cursor:pointer">Restore<input type="file" id="imp" accept="application/json" hidden></label></div></div>
-  <div class="panel"><h2>App</h2><p class="mut sm">Version ${window.__VER || 'live'} · the app updates itself automatically.</p><button class="btn" data-act="update">Check for updates</button></div>
+    <button class="btn pri" data-act="save-rates">Save</button>
+    <h2 style="margin-top:22px">Schools</h2><div class="tagrow">${chipList(s.schools, 'school')}</div><h2 style="margin-top:18px">Classes</h2><div class="tagrow">${chipList(s.classes, 'class')}</div>
+    <h2 style="margin-top:22px">Backup</h2><div class="row"><button class="btn" data-act="export">Download backup</button><label class="btn" style="cursor:pointer">Restore<input type="file" id="imp" accept="application/json" hidden></label></div>
+    <h2 style="margin-top:22px">App</h2><p class="mut sm">Version ${window.__VER || 'live'} · updates itself automatically.</p><button class="btn" data-act="update">Check for updates</button>
+  </details>
   <div class="panel"><button class="btn" data-act="lock">Lock (forget PIN on this device)</button></div></div>`;
 }
 
 /* ---------- push ---------- */
 const b64 = s => { const p = '='.repeat((4 - s.length % 4) % 4), r = atob((s + p).replace(/-/g, '+').replace(/_/g, '/')); return Uint8Array.from([...r].map(c => c.charCodeAt(0))); };
 async function enablePush() {
-  if (isNative()) { await syncNative(); toast('Phone alarms enabled'); return; }
+  if (isNative()) { if (await ensureNativePermission(true)) { await syncNative(true); toast('Phone alarms enabled'); } else toast('Notifications are blocked — allow them in Android settings'); return; }
   if (!('Notification' in window) || !('serviceWorker' in navigator)) return toast('Notifications are not supported on this browser');
   if (await Notification.requestPermission() !== 'granted') return toast('Permission was not granted');
   cfg ||= await api('config');
@@ -181,6 +222,14 @@ document.addEventListener('click', async e => {
   try {
     if (a === 'r-del' && confirm('Delete this reminder?')) { await api('reminder-delete', { id }); await loadState(); refresh(); }
     else if (a === 'r-done') { await api('reminder-done', { id }); await loadState(); refresh(); }
+    else if (a === 'quick') {
+      const d = new Date(), v = t.dataset.v;
+      if (v === '10' || v === '60') d.setMinutes(d.getMinutes() + Number(v)); else if (v === 'eve') { d.setHours(19, 0, 0, 0); if (d < new Date()) d.setDate(d.getDate() + 1); } else { d.setDate(d.getDate() + 1); d.setHours(9, 0, 0, 0); }
+      $('#rf [name=at]').value = toLocalInput(d.getTime());
+    }
+    else if (a === 'w-edit') { const e = S.work.find(x => x.id === id); if (e) { ui.tab = 'log'; ui.editWork = id; ui.prefill = { school: e.school, class: e.class, start: e.start, end: e.end, date: e.date, note: e.note }; history.replaceState(null, '', '#/work'); refresh(); scrollTo({ top: 0, behavior: 'smooth' }); } }
+    else if (a === 'test-native') await testNative();
+    else if (a === 'same-last') { const l = S.work.slice().sort((x, y) => (y.date + y.start).localeCompare(x.date + x.start))[0]; if (l) { ui.tab = 'log'; ui.editWork = null; history.replaceState(null, '', '#/work'); ui.prefill = { school: l.school, class: l.class, start: l.start, end: l.end }; refresh(); } }
     else if (a === 'r-snooze') { await api('reminder-snooze', { id, minutes: 60 }); await loadState(); toast('Snoozed 1 hour'); refresh(); }
     else if (a === 'save-rates') {
       const rates = {}; document.querySelectorAll('.rate').forEach(i => { if (Number(i.value) > 0) rates[i.dataset.school] = Number(i.value); });
@@ -220,12 +269,13 @@ document.addEventListener('submit', async e => {
     e.preventDefault(); const f = new FormData(e.target);
     const school = f.get('school') === '__new' ? $('#schNew').value : f.get('school'), cls = f.get('class') === '__new' ? $('#clsNew').value : f.get('class');
     try {
-      await api('work-save', { date: f.get('date'), school, class: cls, start: f.get('start'), end: f.get('end'), note: f.get('note') });
-      await loadState(); toast(`Saved · ${fmtHours(durationMin(f.get('start'), f.get('end')))}`); history.replaceState(null, '', '#/work'); refresh();
+      await api('work-save', { id: ui.editWork || undefined, date: f.get('date'), school, class: cls, start: f.get('start'), end: f.get('end'), note: f.get('note') });
+      ui.editWork = null; await loadState(); toast(`Saved · ${fmtHours(durationMin(f.get('start'), f.get('end')))}`); history.replaceState(null, '', '#/work'); refresh();
     } catch (err) { toast(err.message); }
   }
 });
 document.addEventListener('change', async e => {
+  if (e.target.id === 'fOn') { try { const j = await api('settings-save', { followUp: e.target.checked }); S.settings = j.settings; toast('Saved'); } catch (err) { toast(err.message); } return; }
   if (e.target.id === 'imp' && e.target.files[0]) {
     try { const d = JSON.parse(await e.target.files[0].text()); const r = await api('import', { reminders: d.reminders, work: d.work }); await loadState(); toast(`Restored ${r.imported} items`); refresh(); } catch (err) { toast('Could not restore: ' + err.message); }
     return;
@@ -248,6 +298,7 @@ export async function mount(root, hash) {
   if (!(await gate(root))) return;
   root.innerHTML = page === 'home' ? homePage() : page === 'reminders' ? remindersPage() : page === 'work' ? workPage() : settingsPage();
   durUpdate();
+  if (page === 'settings' && isNative()) nativeStatus().then(st => { if (st && JSON.stringify(st) !== JSON.stringify(ui.nat) && location.hash.startsWith('#/settings')) { ui.nat = st; root.innerHTML = settingsPage(); } });
 }
 
 /* ---------- in-app alarms (while the app is open) ---------- */
@@ -256,7 +307,7 @@ export function startWatcher() {
   const check = async () => {
     if (!getKey() || document.hidden && false) return;
     try {
-      if (!S.loaded || Date.now() - (S._t || 0) > 60000) { await loadState(); S._t = Date.now(); api('tick').catch(() => {}); }
+      if (!S.loaded || Date.now() - (S._t || 0) > 60000) { await loadState(); S._t = Date.now(); }
     } catch { return; }
     const now = Date.now();
     for (const r of S.reminders) if (!r.done && !r.sent && r.at <= now && now - r.at < 6 * 3600e3 && !alerted.has(r.id + r.at)) { alerted.add(r.id + r.at); sessionStorage.setItem('hub.alerted', JSON.stringify([...alerted])); alarm(r); }

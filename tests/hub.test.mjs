@@ -40,7 +40,7 @@ test('reminder fires once, sends LINE flex card, repeating rolls forward', async
   const one = (await call('reminder-save', { title: 'Parent meeting', detail: 'Room 3', at })).json.reminder;
   const rep = (await call('reminder-save', { title: 'Daily standup', at, repeat: 'daily' })).json.reminder;
   const r1 = await tick(); assert.equal(r1.reminders, 2);
-  assert.equal(lineSent.length, 2); assert.equal(lineSent[0].messages[0].type, 'flex'); assert.equal(lineSent[0].to, 'U1');
+  assert.equal(lineSent.length, 1, 'two due reminders must arrive as ONE LINE message'); assert.equal(lineSent[0].messages[0].type, 'flex'); assert.equal(lineSent[0].messages[0].contents.type, 'carousel'); assert.equal(lineSent[0].to, 'U1');
   const r2 = await tick(); assert.equal(r2.reminders, 0, 'must not fire twice');
   const st = (await call('state')).json.reminders;
   assert.ok(st.find(r => r.id === one.id).sent);
@@ -97,4 +97,27 @@ test('weekly report goes out on Sunday evening once', async () => {
   const sun = Date.parse('2026-01-11T13:00:00Z'); // Sunday 21:00 in Asia/Taipei
   const a = await tick(sun); assert.equal(a.weekly, true);
   const b = await tick(sun + 60000); assert.ok(!b.weekly);
+});
+
+test('missed repeating reminder does not flood: rolls to next future time, one message, no double-send race', async () => {
+  lineSent.length = 0; store.delete('hub:reminders'); await call('settings-save', { workPromptOn: false });
+  const now = Date.now();
+  const rep = (await call('reminder-save', { title: 'Old daily', at: now - 5 * 86400e3, repeat: 'daily' })).json.reminder;
+  const [a, b] = await Promise.all([tick(now), tick(now)]); // cron + app at the same moment
+  assert.equal(a.reminders + b.reminders, 1);
+  assert.equal(lineSent.length, 1);
+  const st = (await call('state')).json.reminders.find(r => r.id === rep.id);
+  assert.ok(st.at > now && st.at <= now + 86400e3, 'next occurrence is within the next day');
+  for (let i = 1; i <= 5; i++) await tick(now + i * 60000);
+  assert.equal(lineSent.length, 1, 'no repeats on later minutes');
+});
+
+test('one follow-up only, 30 min after an unacknowledged reminder', async () => {
+  lineSent.length = 0; store.delete('hub:reminders'); const now = Date.now();
+  const r = (await call('reminder-save', { title: 'Follow me', at: now - 1000 })).json.reminder;
+  await tick(now); assert.equal(lineSent.length, 1);
+  assert.equal((await tick(now + 10 * 60000)).followUps || 0, 0);
+  assert.equal((await tick(now + 31 * 60000)).followUps, 1); assert.equal(lineSent.length, 2);
+  assert.equal((await tick(now + 40 * 60000)).followUps || 0, 0); assert.equal(lineSent.length, 2, 'never more than two messages');
+  await call('reminder-delete', { id: r.id });
 });
